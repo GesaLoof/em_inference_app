@@ -4,27 +4,46 @@ from PIL import Image
 from skimage.exposure import match_histograms
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+from em_inference_app.utils.inference_config import InferenceConfig
+from em_inference_app.models.unet import UNet
+from pathlib import Path
 
 
-def build_model(config, device):
-    from em_nuclear_segmentation.models.unet import UNet
-
+def build_model(config: InferenceConfig, device: torch.device):
     model = UNet(
         in_channels=config.in_channels,
         out_channels=config.out_channels
     )
-    model.load_state_dict(torch.load(config.model_path, map_location=device))
+
+    BASE_DIR = Path(__file__).resolve().parents[3]
+    model_path = BASE_DIR / config.model_path
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found at: {model_path}")
+    model.load_state_dict(torch.load(model_path, map_location=device))
+
     model.to(device)
     model.eval()
+
     return model
 
+
+def build_transform(config: InferenceConfig):
+    return A.Compose([
+        A.Resize(config.resize_height, config.resize_width),
+        A.Normalize(mean=(0.5,), std=(0.5,)),
+        ToTensorV2()
+    ])
 
 def predict(
     image_path: str,
     model: torch.nn.Module,
-    config,
-    device: torch.device
-):
+    transform,
+    config: InferenceConfig,
+    device: torch.device,
+    prediction_threshold: float,
+    use_histogram_matching: bool,
+) -> np.ndarray:
+
     # Load image
     original_image = Image.open(image_path)
     image_np = np.array(original_image)
@@ -33,8 +52,8 @@ def predict(
     if image_np.dtype == np.uint16:
         image_np = (image_np / 65535.0 * 255).astype(np.uint8)
 
-    # Histogram matching
-    if config.use_histogram_matching and config.histogram_reference_image:
+    # Histogram matching (optional per request)
+    if use_histogram_matching and config.histogram_reference_image:
         ref = Image.open(config.histogram_reference_image)
         ref_np = np.array(ref)
 
@@ -47,13 +66,7 @@ def predict(
     if image_np.ndim == 3:
         image_np = image_np[..., 0]
 
-    # Albumentations transforms
-    transform = A.Compose([
-        A.Resize(config.resize_height, config.resize_width),
-        A.Normalize(mean=(0.5,), std=(0.5,)),
-        ToTensorV2()
-    ])
-
+    # Apply transform
     sample = transform(image=image_np)
     tensor = sample["image"].unsqueeze(0).to(device)
 
@@ -61,12 +74,13 @@ def predict(
     with torch.no_grad():
         output = model(tensor)
         probs = torch.sigmoid(output)
+
         pred_mask = (
             probs.squeeze(0)
                  .squeeze(0)
                  .cpu()
                  .numpy()
-                 > config.prediction_threshold
+                 > prediction_threshold
         ).astype(np.uint8) * 255
 
     # Resize back to original size
@@ -76,4 +90,4 @@ def predict(
         resample=Image.NEAREST
     )
 
-    return pred_mask_resized
+    return np.array(pred_mask_resized)
